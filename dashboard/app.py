@@ -1,138 +1,275 @@
 #!/usr/bin/env python3
-"""PiWAF 儀表板：讀 SQLite，呈現 WAF 防禦決策的可視化。"""
+"""PiWAF 輕量儀表板後端：FastAPI 對 SQLite 下 SQL 聚合，回傳 JSON。
+
+不用 pandas/streamlit —— 聚合全交給 SQLite，渲染交給瀏覽器的 Chart.js。
+另含「負載監測」：背景採樣主機 load/RAM/swap + 目前流量，判定能否負荷，
+過載時在儀表板跳警示、並可打 webhook 對外告警。
+"""
 import json
 import os
-from collections import Counter
+import threading
+import time
+import urllib.request
+from datetime import datetime, timedelta
 
-import pandas as pd
 import sqlite3
-import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 DB_PATH = os.environ.get("DB_PATH", "/data/piwaf.db")
 THRESHOLD = int(os.environ.get("ANOMALY_THRESHOLD", "5"))
+HERE = os.path.dirname(os.path.abspath(__file__))
 
-st.set_page_config(page_title="PiWAF Observatory", layout="wide")
-st_autorefresh(interval=5000, key="refresh")   # 每 5 秒自動更新
+# ── 負載監測門檻（可用環境變數覆寫）──
+LOAD_WARN = float(os.environ.get("HEALTH_LOAD_WARN", "1.0"))   # load1/核心數
+LOAD_CRIT = float(os.environ.get("HEALTH_LOAD_CRIT", "2.0"))
+MEM_WARN = float(os.environ.get("HEALTH_MEM_WARN", "15"))      # 可用記憶體 %（低於則警示）
+MEM_CRIT = float(os.environ.get("HEALTH_MEM_CRIT", "7"))
+SWAP_WARN = float(os.environ.get("HEALTH_SWAP_WARN", "50"))    # swap 使用 %（高於則警示）
+SWAP_CRIT = float(os.environ.get("HEALTH_SWAP_CRIT", "80"))
+HEALTH_INTERVAL = int(os.environ.get("HEALTH_INTERVAL", "10"))
+ALERT_WEBHOOK = os.environ.get("ALERT_WEBHOOK", "").strip()
+ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "300"))
+
+app = FastAPI(title="PiWAF API")
+
+LATEST_HEALTH = {"status": "unknown", "reasons": [], "metrics": {}, "time": None}
+_alert_state = {"last_status": "ok", "last_sent": 0.0}
 
 
-@st.cache_data(ttl=4)
-def load() -> pd.DataFrame:
-    # 唯讀開啟，配合 parser 的 WAL，可邊寫邊讀
-    uri = f"file:{DB_PATH}?mode=ro"
+def connect():
+    """唯讀開啟 SQLite（配合 parser 的 WAL，可邊寫邊讀）。"""
+    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+
+
+# ── 負載監測 ────────────────────────────────────────────────────────────
+def read_loadavg():
+    with open("/proc/loadavg") as f:
+        parts = f.read().split()
+    return float(parts[0]), float(parts[1]), float(parts[2])
+
+
+def read_meminfo():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, _, rest = line.partition(":")
+            info[k] = int(rest.split()[0])  # kB
+    return info
+
+
+def req_per_min():
     try:
-        con = sqlite3.connect(uri, uri=True)
-    except sqlite3.OperationalError:
-        return pd.DataFrame()
-    try:
-        df = pd.read_sql_query("SELECT * FROM events", con)
-    except Exception:
-        return pd.DataFrame()
-    finally:
+        con = connect()
+        cutoff = (datetime.now() - timedelta(seconds=60)).isoformat(timespec="seconds")
+        n = con.execute("SELECT COUNT(*) FROM events WHERE ts>=?", (cutoff,)).fetchone()[0]
         con.close()
-    return df
+        return n
+    except sqlite3.OperationalError:
+        return 0
 
 
-st.title("🛡️ PiWAF Observatory")
-st.caption("BunkerWeb（ModSecurity + OWASP CRS）防禦決策可視化")
+def worst(a, b):
+    order = {"ok": 0, "warn": 1, "critical": 2}
+    return a if order[a] >= order[b] else b
 
-df = load()
-if df.empty:
-    st.info("目前沒有資料。請啟動服務並送出流量：`docker compose run --rm generator`")
-    st.stop()
 
-# ── 側邊欄篩選 ──
-with st.sidebar:
-    st.header("篩選")
-    modes = sorted(df["mode"].dropna().unique())
-    scenarios = sorted(df["scenario"].dropna().unique())
-    sel_mode = st.multiselect("WAF 模式", modes, default=modes)
-    sel_scen = st.multiselect("情境 scenario", scenarios, default=scenarios)
+def compute_health():
+    ncpu = os.cpu_count() or 1
+    load1, load5, _ = read_loadavg()
+    mem = read_meminfo()
+    mem_total = mem.get("MemTotal", 0)
+    mem_avail = mem.get("MemAvailable", 0)
+    swap_total = mem.get("SwapTotal", 0)
+    swap_free = mem.get("SwapFree", 0)
 
-view = df[df["mode"].isin(sel_mode) & df["scenario"].isin(sel_scen)]
-if view.empty:
-    st.warning("此篩選條件下沒有資料。")
-    st.stop()
+    load_ratio = load1 / ncpu
+    mem_avail_pct = (mem_avail / mem_total * 100) if mem_total else 100
+    swap_used_pct = ((swap_total - swap_free) / swap_total * 100) if swap_total else 0
+    rpm = req_per_min()
 
-# ── KPI ──
-total = len(view)
-blocked = int(view["blocked"].sum())
-would = int(view["would_block"].sum())
-attacks = int((view["category"] != "None").sum())
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("總 request", total)
-c2.metric("實際阻擋 (403)", blocked, f"{blocked/total*100:.0f}%")
-c3.metric(f"分數≥{THRESHOLD}（本來會擋）", would, f"{would/total*100:.0f}%")
-c4.metric("可疑/攻擊", attacks, f"{attacks/total*100:.0f}%")
+    status, reasons = "ok", []
 
-st.divider()
-col_l, col_r = st.columns(2)
+    def check(level_warn, level_crit, value, hi, msg):
+        nonlocal status
+        if hi:  # 越高越糟
+            if value >= level_crit:
+                status = worst(status, "critical"); reasons.append("🔴 " + msg)
+            elif value >= level_warn:
+                status = worst(status, "warn"); reasons.append("🟠 " + msg)
+        else:   # 越低越糟
+            if value <= level_crit:
+                status = worst(status, "critical"); reasons.append("🔴 " + msg)
+            elif value <= level_warn:
+                status = worst(status, "warn"); reasons.append("🟠 " + msg)
 
-# ── 攻擊類型分布 ──
-with col_l:
-    st.subheader("攻擊類型分布")
-    cat = view[view["category"] != "None"]["category"].value_counts()
-    if not cat.empty:
-        st.bar_chart(cat)
-    else:
-        st.write("（無攻擊事件）")
+    check(LOAD_WARN, LOAD_CRIT, load_ratio, True,
+          f"CPU 負載 {load1:.1f}（{ncpu} 核，比值 {load_ratio:.2f}）")
+    check(MEM_WARN, MEM_CRIT, mem_avail_pct, False,
+          f"可用記憶體僅 {mem_avail_pct:.0f}%")
+    # swap 只有在「記憶體也吃緊」時才算過載訊號 —— 單純 swap 滿、RAM 還夠是 Linux 常態，
+    # 會在記憶體耗盡 + 持續換頁（thrashing）時才真正拖垮機器。
+    if mem_avail_pct <= MEM_WARN:
+        check(SWAP_WARN, SWAP_CRIT, swap_used_pct, True,
+              f"swap 使用 {swap_used_pct:.0f}%（且記憶體吃緊）")
 
-# ── 阻擋 vs 放行 ──
-with col_r:
-    st.subheader("阻擋 / 放行")
-    outcome = view["blocked"].map({1: "Blocked (403)", 0: "Passed"}).value_counts()
-    st.bar_chart(outcome)
+    return {
+        "status": status,
+        "reasons": reasons,
+        "metrics": {
+            "load1": round(load1, 2), "load5": round(load5, 2), "ncpu": ncpu,
+            "load_ratio": round(load_ratio, 2),
+            "mem_total_mb": round(mem_total / 1024),
+            "mem_avail_mb": round(mem_avail / 1024),
+            "mem_avail_pct": round(mem_avail_pct),
+            "swap_total_mb": round(swap_total / 1024),
+            "swap_used_pct": round(swap_used_pct),
+            "req_per_min": rpm, "req_per_sec": round(rpm / 60, 1),
+        },
+        "time": datetime.now().isoformat(timespec="seconds"),
+    }
 
-col_l2, col_r2 = st.columns(2)
 
-# ── Top 觸發規則 ──
-with col_l2:
-    st.subheader("Top 觸發規則")
-    rc = Counter()
-    for raw in view["rule_ids"].dropna():
-        rc.update(json.loads(raw))
-    if rc:
-        top = pd.Series(dict(rc.most_common(10))).sort_values(ascending=False)
-        st.bar_chart(top)
-    else:
-        st.write("（無規則觸發）")
+def send_webhook(health, recovered=False):
+    if not ALERT_WEBHOOK:
+        return
+    m = health["metrics"]
+    icon = "✅" if recovered else ("🔴" if health["status"] == "critical" else "🟠")
+    title = "負載已恢復" if recovered else f"負載警報 [{health['status']}]"
+    msg = (f"{icon} PiWAF {title}\n"
+           f"原因: {'; '.join(health['reasons']) or '正常'}\n"
+           f"流量: {m['req_per_min']} req/min（{m['req_per_sec']} req/s）\n"
+           f"load {m['load1']}/{m['ncpu']} · mem avail {m['mem_avail_pct']}% · "
+           f"swap {m['swap_used_pct']}%")
+    payload = json.dumps({"content": msg, "text": msg,  # Discord/Slack 相容
+                          "status": health["status"], "reasons": health["reasons"],
+                          "metrics": m}).encode()
+    try:
+        req = urllib.request.Request(ALERT_WEBHOOK, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:  # noqa: BLE001 — 告警失敗不能拖垮服務
+        print(f"[monitor] webhook 失敗：{e}", flush=True)
 
-# ── Top 目標端點 ──
-with col_r2:
-    st.subheader("Top 目標端點")
-    ep = view["path"].value_counts().head(10)
-    st.bar_chart(ep)
 
-# ── Anomaly score 分布 ──
-st.subheader("Anomaly Score 分布")
-score_hist = view["anomaly_score"].value_counts().sort_index()
-st.bar_chart(score_hist)
+def monitor_loop():
+    global LATEST_HEALTH
+    while True:
+        try:
+            h = compute_health()
+            LATEST_HEALTH = h
+            now = time.time()
+            prev = _alert_state["last_status"]
+            if h["status"] == "critical":
+                if prev != "critical" or now - _alert_state["last_sent"] > ALERT_COOLDOWN:
+                    send_webhook(h)
+                    _alert_state["last_sent"] = now
+            elif prev == "critical":   # 從 critical 恢復
+                send_webhook(h, recovered=True)
+            _alert_state["last_status"] = h["status"]
+        except Exception as e:  # noqa: BLE001
+            print(f"[monitor] 採樣失敗：{e}", flush=True)
+        time.sleep(HEALTH_INTERVAL)
 
-# ── 時間線 ──
-st.subheader("事件時間線")
-tl = view.copy()
-tl["ts"] = pd.to_datetime(tl["ts"], errors="coerce")
-tl = tl.dropna(subset=["ts"]).set_index("ts")
-if not tl.empty:
-    per = tl.resample("10s").agg(total=("id", "count"), blocked=("blocked", "sum"))
-    st.line_chart(per)
 
-# ── 模式比較（Detection vs Blocking）──
-if len(sel_mode) > 1 or df["mode"].nunique() > 1:
-    st.subheader("模式比較：Detection vs Blocking")
-    cmp = df.groupby("mode").agg(
-        requests=("id", "count"),
-        actually_blocked=("blocked", "sum"),
-        would_block=("would_block", "sum"),
-        avg_score=("anomaly_score", "mean"),
-    ).round(2)
-    st.dataframe(cmp, use_container_width=True)
+@app.on_event("startup")
+def start_monitor():
+    LATEST_HEALTH.update(compute_health())
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    print(f"[monitor] 啟動，每 {HEALTH_INTERVAL}s 採樣"
+          f"{'（webhook 已設定）' if ALERT_WEBHOOK else ''}", flush=True)
 
-# ── 明細 ──
-with st.expander("原始事件明細"):
-    st.dataframe(
-        view[["ts", "client_ip", "method", "path", "status",
-              "anomaly_score", "category", "n_rules", "scenario", "mode"]]
-        .sort_values("ts", ascending=False),
-        use_container_width=True,
-    )
+
+@app.get("/api/health")
+def health():
+    return JSONResponse(LATEST_HEALTH)
+
+
+# ── 攻擊資料聚合 ─────────────────────────────────────────────────────────
+def build_where(mode, scenario):
+    where, params = "1=1", []
+    if mode:
+        where += " AND mode=?"
+        params.append(mode)
+    if scenario:
+        where += " AND scenario=?"
+        params.append(scenario)
+    return where, params
+
+
+@app.get("/api/stats")
+def stats(mode: str = "", scenario: str = ""):
+    base = {"threshold": THRESHOLD, "health": LATEST_HEALTH}
+    try:
+        con = connect()
+        con.execute("SELECT 1 FROM events LIMIT 1")
+    except sqlite3.OperationalError:
+        return JSONResponse({"empty": True, **base})
+
+    w, p = build_where(mode, scenario)
+    one = lambda sql, pr=p: con.execute(sql, pr).fetchone()[0]
+    rows = lambda sql, pr=p: con.execute(sql, pr).fetchall()
+
+    total = one(f"SELECT COUNT(*) FROM events WHERE {w}")
+    if total == 0:
+        opts = filter_options(con)
+        return JSONResponse({"empty": True, "filters": opts, **base})
+
+    blocked = one(f"SELECT COALESCE(SUM(blocked),0) FROM events WHERE {w}")
+    would = one(f"SELECT COALESCE(SUM(would_block),0) FROM events WHERE {w}")
+    attacks = one(f"SELECT COUNT(*) FROM events WHERE category!='None' AND {w}")
+
+    data = {
+        "empty": False,
+        **base,
+        "kpi": {"total": total, "blocked": blocked,
+                "would_block": would, "attacks": attacks},
+        "categories": [
+            {"label": r[0], "n": r[1]} for r in rows(
+                f"SELECT category,COUNT(*) FROM events "
+                f"WHERE category!='None' AND {w} GROUP BY category ORDER BY 2 DESC")],
+        "outcome": {"blocked": blocked, "passed": total - blocked},
+        "top_rules": [
+            {"label": r[0], "n": r[1]} for r in rows(
+                f"SELECT je.value,COUNT(*) FROM events,json_each(events.rule_ids) je "
+                f"WHERE {w} GROUP BY je.value ORDER BY 2 DESC LIMIT 10")],
+        "top_endpoints": [
+            {"label": r[0], "n": r[1]} for r in rows(
+                f"SELECT path,COUNT(*) FROM events "
+                f"WHERE path IS NOT NULL AND {w} GROUP BY path ORDER BY 2 DESC LIMIT 10")],
+        "scores": [
+            {"score": r[0], "n": r[1]} for r in rows(
+                f"SELECT anomaly_score,COUNT(*) FROM events "
+                f"WHERE {w} GROUP BY anomaly_score ORDER BY anomaly_score")],
+        "timeline": [
+            {"t": r[0], "total": r[1], "blocked": r[2]} for r in rows(
+                f"SELECT substr(ts,1,16),COUNT(*),COALESCE(SUM(blocked),0) "
+                f"FROM events WHERE {w} GROUP BY 1 ORDER BY 1")],
+        "modes": [
+            {"mode": r[0], "requests": r[1], "blocked": r[2],
+             "would_block": r[3], "avg_score": r[4]} for r in con.execute(
+                "SELECT mode,COUNT(*),COALESCE(SUM(blocked),0),"
+                "COALESCE(SUM(would_block),0),ROUND(AVG(anomaly_score),2) "
+                "FROM events GROUP BY mode ORDER BY 2 DESC")],
+        "filters": filter_options(con),
+    }
+    con.close()
+    return JSONResponse(data)
+
+
+def filter_options(con):
+    try:
+        modes = [r[0] for r in con.execute(
+            "SELECT DISTINCT mode FROM events WHERE mode IS NOT NULL ORDER BY 1")]
+        scenarios = [r[0] for r in con.execute(
+            "SELECT DISTINCT scenario FROM events WHERE scenario IS NOT NULL ORDER BY 1")]
+    except sqlite3.OperationalError:
+        modes, scenarios = [], []
+    return {"modes": modes, "scenarios": scenarios}
+
+
+# 靜態前端掛在根路徑（要放在 API 路由之後）
+app.mount("/", StaticFiles(directory=os.path.join(HERE, "static"), html=True),
+          name="static")

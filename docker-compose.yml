@@ -1,10 +1,10 @@
 # PiWAF Observatory — BunkerWeb 整包 + 自訂可視化 pipeline
 #
-#   generator ─► bunkerweb (WAF) ─► juice-shop (測試站)
+#   generator ─► bunkerweb (WAF) ─► webapp (後端佔位服務 whoami)
 #                     │
 #                     ├─ modsec JSON audit log ─► parser ─► SQLite ─► dashboard
 #                     │
-#   Direct Mode：generator/瀏覽器 ─► juice-shop:3001（繞過 WAF，做 baseline）
+#   Direct Mode：generator/瀏覽器 ─► webapp:3001（繞過 WAF，做 baseline）
 
 services:
   # ── WAF：BunkerWeb 反向代理（內含 nginx + ModSecurity + OWASP CRS）──
@@ -33,7 +33,7 @@ services:
       SERVER_NAME: "piwaf.local"
       MULTISITE: "no"
       USE_REVERSE_PROXY: "yes"
-      REVERSE_PROXY_HOST: "http://juice-shop:3000"
+      REVERSE_PROXY_HOST: "http://webapp:3000"
       REVERSE_PROXY_URL: "/"
       # WAF / ModSecurity / CRS
       USE_MODSECURITY: "yes"
@@ -64,9 +64,12 @@ services:
     networks:
       - bw-universe
 
-  # ── 測試網站（故意有漏洞）。Juice Shop 為 multi-arch，Pi arm64 可跑 ──
-  juice-shop:
-    image: bkimminich/juice-shop:latest
+  # ── 被保護的後端服務（佔位用）。traefik/whoami：~5MB、multi-arch(arm64)，
+  #    對任何路徑都回 200，所以「放行」流量乾淨顯示 200。WAF 偵測在請求進來就判定，
+  #    後端是什麼不影響攻擊偵測展示。要更真實可換回 Juice Shop / DVWA。──
+  webapp:
+    image: traefik/whoami:latest
+    command: ["--port", "3000"]   # whoami 會自己加冒號，給數字即可
     restart: unless-stopped
     ports:
       - "${BIND_ADDR}${APP_DIRECT_PORT}:3000"   # Direct Mode：繞過 WAF 的 baseline 入口
@@ -89,7 +92,7 @@ services:
     networks:
       - bw-universe
 
-  # ── 儀表板：Streamlit 讀 SQLite，呈現攻擊類型/規則/anomaly/時間線 ──
+  # ── 儀表板：FastAPI + Chart.js，呈現攻擊圖表 + 主機負載監測 ──
   dashboard:
     build: ./dashboard
     restart: unless-stopped
@@ -98,6 +101,12 @@ services:
     environment:
       DB_PATH: "/data/piwaf.db"
       ANOMALY_THRESHOLD: "${ANOMALY_THRESHOLD}"
+      # 負載監測：過載時打 webhook 告警（Discord/Slack/自架皆可，留空則只在儀表板顯示）
+      ALERT_WEBHOOK: "${ALERT_WEBHOOK:-}"
+      # 門檻可選覆寫（load=load1/核心數；mem=可用%；swap=使用%）
+      HEALTH_LOAD_CRIT: "${HEALTH_LOAD_CRIT:-2.0}"
+      HEALTH_MEM_CRIT: "${HEALTH_MEM_CRIT:-7}"
+      HEALTH_SWAP_CRIT: "${HEALTH_SWAP_CRIT:-80}"
     volumes:
       - piwaf-data:/data:ro
     networks:
@@ -108,7 +117,7 @@ services:
     build: ./generator
     profiles: ["tools"]
     environment:
-      TARGET: "http://bunkerweb:8080"   # 經過 WAF；要打 Direct 改 http://juice-shop:3000
+      TARGET: "http://bunkerweb:8080"   # 經過 WAF；要打 Direct 改 http://webapp:3000
     networks:
       - bw-services
 
