@@ -32,15 +32,28 @@ uname -m        # 要顯示 aarch64（不是 armv7l）
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-
-# 把 swap 從預設 100MB 提到 2GB
-sudo dphys-swapfile swapoff
-sudo sed -i 's/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
-sudo sed -i 's/^#\?CONF_MAXSWAP=.*/CONF_MAXSWAP=2048/' /etc/dphys-swapfile
-sudo dphys-swapfile setup
-sudo dphys-swapfile swapon
-free -h         # 確認 Swap 那行約 2.0Gi
 ```
+
+**開 2GB swap（通用做法，任何發行版都可用）：**
+
+```bash
+swapon --show                 # 先看有沒有現成 swap；有 /swap.img 之類就只需擴大
+sudo swapoff -a 2>/dev/null
+sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+free -h                       # 確認 Swap 那行約 2.0Gi
+grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+> **只有 Raspberry Pi OS (Raspbian)** 才有 `dphys-swapfile` 工具；那種系統可改用：
+> `sudo dphys-swapfile swapoff` →
+> 編輯 `/etc/dphys-swapfile` 設 `CONF_SWAPSIZE=2048`、`CONF_MAXSWAP=2048` →
+> `sudo dphys-swapfile setup && sudo dphys-swapfile swapon`。
+> Ubuntu Server / 其他系統沒有此工具，請用上面的 `/swapfile` 通用做法。
+
+> 根目錄若是 **btrfs**，swapfile 需特別處理（`chattr +C`、不可壓縮）；ext4 直接照上面即可。
 
 （可選）啟用 cgroup 記憶體控制，之後才能對容器設記憶體上限 —— 編輯 `/boot/firmware/cmdline.txt`
 （舊版在 `/boot/cmdline.txt`），在**同一行結尾**加上：`cgroup_enable=memory cgroup_memory=1`，
