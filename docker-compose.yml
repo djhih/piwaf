@@ -1,0 +1,138 @@
+# PiWAF Observatory — BunkerWeb 整包 + 自訂可視化 pipeline
+#
+#   generator ─► bunkerweb (WAF) ─► juice-shop (測試站)
+#                     │
+#                     ├─ modsec JSON audit log ─► parser ─► SQLite ─► dashboard
+#                     │
+#   Direct Mode：generator/瀏覽器 ─► juice-shop:3001（繞過 WAF，做 baseline）
+
+services:
+  # ── WAF：BunkerWeb 反向代理（內含 nginx + ModSecurity + OWASP CRS）──
+  bunkerweb:
+    image: bunkerity/bunkerweb:${BW_VERSION}
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR}${BW_HTTP_PORT}:8080"
+    environment:
+      API_WHITELIST_IP: "127.0.0.0/8 10.20.30.0/24"
+    volumes:
+      # 整個 log 目錄用 host bind 取代 BunkerWeb 內建的「全部 symlink 到 stderr」。
+      # access/error 仍是 → stdout/stderr 的 symlink，但 modsec_audit.log 是真實檔，
+      # ModSecurity 的 JSON audit 才寫得進去、parser 才 tail 得到。
+      - ./logs:/var/log/bunkerweb
+    networks:
+      - bw-universe
+      - bw-services
+
+  # ── BunkerWeb 排程器：套用設定、派送自訂 modsec 設定到 bunkerweb ──
+  bw-scheduler:
+    image: bunkerity/bunkerweb-scheduler:${BW_VERSION}
+    restart: unless-stopped
+    environment:
+      BUNKERWEB_INSTANCES: "bunkerweb"
+      SERVER_NAME: "piwaf.local"
+      MULTISITE: "no"
+      USE_REVERSE_PROXY: "yes"
+      REVERSE_PROXY_HOST: "http://juice-shop:3000"
+      REVERSE_PROXY_URL: "/"
+      # WAF / ModSecurity / CRS
+      USE_MODSECURITY: "yes"
+      USE_MODSECURITY_CRS: "yes"
+      # 關掉 global CRS：改為 per-server 載入，讓自訂 modsec conf 與預設 audit
+      # 設定處於同一 context，SecAuditLog/Format 的覆寫才會生效。
+      USE_MODSECURITY_GLOBAL_CRS: "no"
+      MODSECURITY_CRS_VERSION: "4"
+      MODSECURITY_SEC_RULE_ENGINE: "${WAF_MODE}"
+      MODSECURITY_SEC_AUDIT_ENGINE: "On"          # 全記錄，才能算 pass/block 比例
+      # 關掉會干擾乾淨測試的 BunkerWeb 額外防護
+      USE_BAD_BEHAVIOR: "no"
+      USE_LIMIT_REQ: "no"
+      USE_ANTIBOT: "no"
+      USE_BUNKERNET: "no"
+      USE_REVERSE_PROXY_CACHE: "no"
+      # 自訂 modsec 設定：把 audit log 輸出成 JSON、寫到共享 volume，給 parser 撈。
+      # BunkerWeb 用 CUSTOM_CONF_MODSEC_<name> 環境變數注入（不要掛載 /data/configs，
+      # scheduler 需要對該目錄有寫入權）。
+      # BunkerWeb 預設已有一條 SecAuditLog（指向 modsec_audit.log，原本是 stderr symlink，
+      # 我們用 bind-mount 把它換成真實檔）。這裡「只」補 JSON 格式，不能再寫第二條
+      # SecAuditLog —— libmodsecurity 遇到重複的 SecAuditLog 會直接停用 audit。
+      CUSTOM_CONF_MODSEC_piwaf_audit: |-
+        SecAuditEngine On
+        SecAuditLogFormat JSON
+    volumes:
+      - bw-data:/data
+    networks:
+      - bw-universe
+
+  # ── 測試網站（故意有漏洞）。Juice Shop 為 multi-arch，Pi arm64 可跑 ──
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR}${APP_DIRECT_PORT}:3000"   # Direct Mode：繞過 WAF 的 baseline 入口
+    networks:
+      - bw-services
+
+  # ── 解析器：tail modsec JSON audit log → 正規化 → 寫入 SQLite ──
+  parser:
+    build: ./parser
+    restart: unless-stopped
+    environment:
+      MODSEC_AUDIT_LOG: "/var/log/bunkerweb/modsec_audit.log"
+      ERROR_LOG: "/var/log/bunkerweb/error.log"
+      DB_PATH: "/data/piwaf.db"
+      ANOMALY_THRESHOLD: "${ANOMALY_THRESHOLD}"
+      WAF_MODE: "${WAF_MODE}"
+    volumes:
+      - ./logs:/var/log/bunkerweb:ro
+      - piwaf-data:/data
+    networks:
+      - bw-universe
+
+  # ── 儀表板：Streamlit 讀 SQLite，呈現攻擊類型/規則/anomaly/時間線 ──
+  dashboard:
+    build: ./dashboard
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR}${DASHBOARD_PORT}:8501"
+    environment:
+      DB_PATH: "/data/piwaf.db"
+      ANOMALY_THRESHOLD: "${ANOMALY_THRESHOLD}"
+    volumes:
+      - piwaf-data:/data:ro
+    networks:
+      - bw-universe
+
+  # ── 流量情境產生器（手動觸發）：docker compose run --rm generator ──
+  generator:
+    build: ./generator
+    profiles: ["tools"]
+    environment:
+      TARGET: "http://bunkerweb:8080"   # 經過 WAF；要打 Direct 改 http://juice-shop:3000
+    networks:
+      - bw-services
+
+  # ── go-ftw：現成的 OWASP CRS 攻擊測試集（手動觸發）──
+  #   docker-compose run --rm ftw                 # 跑全套
+  #   docker-compose run --rm ftw run -d /tests --config /etc/ftw/config.yaml -i 942
+  ftw:
+    build: ./ftw
+    profiles: ["tools"]
+    volumes:
+      - ./ftw/config.yaml:/etc/ftw/config.yaml:ro   # 可直接改設定不必重建
+    networks:
+      - bw-services
+
+networks:
+  bw-universe:
+    name: bw-universe
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.20.30.0/24
+  bw-services:
+    name: bw-services
+
+volumes:
+  bw-data:
+  piwaf-data:

@@ -1,0 +1,16 @@
+# go-ftw 設定
+#
+# 用 cloud 模式：只看 HTTP 回應碼判定（403=擋），不讀 WAF log、不需 marker 規則。
+# 對我們最省事 —— 不必把 error.log 掛進來、不必改 BunkerWeb，跑得快；攻擊流量
+# 照樣經過 BunkerWeb，被 parser/dashboard 抓到。
+mode: cloud
+
+testoverride:
+  input:
+    # 強制所有 CRS 測試打我們的 WAF 入口（容器內網名稱）
+    dest_addr: "bunkerweb"
+    port: 8080
+    protocol: "http"
+    # FTW 預設用 dest_addr 當 Host header。BunkerWeb 非 multisite 模式接受任意 Host，
+    # 所以 Host: bunkerweb 會被正常代理到 juice-shop（generator 也是這樣打的）。
+    # 若日後改成 multisite、需要精確 piwaf.local，再加 headers 覆寫即可。

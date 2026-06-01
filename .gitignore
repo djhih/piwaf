@@ -1,0 +1,39 @@
+# ── 環境設定（含本機 LAN IP 等環境敏感值）──────────────────
+# .env 不上 repo；改提供 .env.example 範本，clone 後 cp 一份
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ── 執行期 log（含來源 IP、攻擊 payload 等請求紀錄，敏感）──
+# 保留 logs/ 目錄（bind-mount 需要），但忽略所有內容
+logs/*
+!logs/.gitkeep
+
+# ── 資料庫 / 快取（正常在 Docker named volume，這裡保險）──
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ── 掃描工具輸出報告 ──
+reports/
+*.report.json
+gotestwaf-report-*
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ── 編輯器 / 作業系統雜物 ──
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
