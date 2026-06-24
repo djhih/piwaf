@@ -96,6 +96,7 @@ ALERT_WEBHOOK=
 ## 5. 啟動（首次 build 會慢，耐心等）
 
 ```bash
+./setup.sh                 # 先備好 logs/ 權限（容器內 nginx uid 101 要能寫，否則 error.log permission denied）
 docker compose up -d --build
 ```
 
@@ -180,6 +181,8 @@ docker compose up -d dashboard       # compose v2 直接這樣即可
 | `docker compose` 找不到指令 | 用對版本：Pi 上是 `docker compose`（v2，空格），不是 `docker-compose` |
 | build 較久 | 正常，Pi 3 本來就慢；dashboard 已改輕量(fastapi/uvicorn)，最慢的是首次 `run ftw` 的 Go 編譯 |
 | 瀏覽器連不到儀表板 | 確認 `.env` 的 `BIND_ADDR` 是 Pi 的 LAN IP；防火牆有放行該網段；用 `http://<pi-ip>:8501` 不是 localhost |
+| 儀表板**回 404**（有回應、不是連不到） | 前端 `dashboard/static/index.html` 沒進 image。確認版控有此檔：`git ls-files dashboard/static/` 要列出 `index.html`（早期被 `.gitignore` 的 `*.html` 擋掉漏 commit）。Pi 上 `git pull` 後**務必重建**：`docker compose up -d --build dashboard`——前端是 build 時 `COPY` 進 image，光 pull 不重建不生效。驗證：`docker compose exec dashboard ls /app/static/index.html` |
+| `error.log` **permission denied** / parser 讀不到 log | 忘了跑 `./setup.sh`（容器內 nginx uid 101 無法寫你帳號的 logs/）。修復：`docker compose down` → `sudo chown -R "$(id -u):$(id -g)" logs` → `./setup.sh` → `docker compose up -d` |
 
 ### 後端用 whoami（預設，已最佳化）
 
