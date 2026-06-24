@@ -38,5 +38,9 @@ venv/
 .DS_Store
 Thumbs.db
 
-*.pdf 
+# ── 簡報 / 輸出檔（不上 repo）──────────────────────────────
+# 註：*.html 會誤擋 dashboard 前端，所以要把 dashboard/static 排除在外
+*.pdf
 *.html
+!dashboard/static/
+!dashboard/static/*.html

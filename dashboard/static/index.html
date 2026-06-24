@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiWAF Observatory</title>
+<script src="chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1419; --card:#1a2230; --line:#2a3548; --fg:#e6edf3; --mut:#8b98a9;
+          --red:#ff5c5c; --grn:#34d399; --blu:#5b9dff; --amb:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:system-ui,"Noto Sans CJK TC",sans-serif; }
+  header { padding:16px 22px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  .sub { color:var(--mut); font-size:13px; }
+  .filters { margin-left:auto; display:flex; gap:10px; align-items:center; }
+  select { background:var(--card); color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:6px 8px; font-size:13px; }
+  .wrap { padding:18px 22px; }
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px; }
+  .kpi { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .kpi .v { font-size:26px; font-weight:700; }
+  .kpi .l { color:var(--mut); font-size:12px; margin-top:4px; }
+  .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:13px; margin:0 0 10px; color:var(--mut); font-weight:600; }
+  .card.full { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:600; }
+  canvas { max-height:260px; }
+  #stamp { color:var(--mut); font-size:12px; }
+  .empty { color:var(--mut); padding:40px; text-align:center; }
+  /* 負載監測狀態條 */
+  #health { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+            border:1px solid var(--line); border-radius:10px; padding:10px 14px; margin-bottom:16px; }
+  #health.ok { background:rgba(52,211,153,.08); border-color:rgba(52,211,153,.4); }
+  #health.warn { background:rgba(251,191,36,.10); border-color:rgba(251,191,36,.5); }
+  #health.critical { background:rgba(255,92,92,.12); border-color:rgba(255,92,92,.6); }
+  #health .dot { width:10px; height:10px; border-radius:50%; flex:0 0 auto; }
+  #health.ok .dot { background:var(--grn); }
+  #health.warn .dot { background:var(--amb); }
+  #health.critical .dot { background:var(--red); animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+  #health .htext { font-size:13px; font-weight:600; }
+  #health .hmetrics { color:var(--mut); font-size:12px; margin-left:auto;
+                      font-variant-numeric:tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛡️ PiWAF Observatory</h1>
+  <span class="sub">BunkerWeb（ModSecurity + OWASP CRS）防禦決策可視化</span>
+  <div class="filters">
+    <label class="sub">模式 <select id="f-mode"><option value="">全部</option></select></label>
+    <label class="sub">情境 <select id="f-scenario"><option value="">全部</option></select></label>
+    <span id="stamp"></span>
+  </div>
+</header>
+
+<div class="wrap">
+  <div id="health" class="ok">
+    <span class="dot"></span>
+    <span class="htext" id="h-text">負載監測中…</span>
+    <span class="hmetrics" id="h-metrics"></span>
+  </div>
+
+  <div id="empty" class="empty" style="display:none">
+    目前沒有資料。請啟動服務並送流量：<code>docker compose run --rm generator</code>
+  </div>
+
+  <div id="board" style="display:none">
+    <div class="kpis">
+      <div class="kpi"><div class="v" id="k-total">0</div><div class="l">總 request</div></div>
+      <div class="kpi"><div class="v" id="k-blocked" style="color:var(--red)">0</div><div class="l">實際阻擋 (403)</div></div>
+      <div class="kpi"><div class="v" id="k-would" style="color:var(--amb)">0</div><div class="l" id="k-would-l">分數超標（本來會擋）</div></div>
+      <div class="kpi"><div class="v" id="k-attacks" style="color:var(--blu)">0</div><div class="l">可疑 / 攻擊</div></div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><h2>攻擊類型分布</h2><canvas id="c-cat"></canvas></div>
+      <div class="card"><h2>阻擋 / 放行</h2><canvas id="c-outcome"></canvas></div>
+      <div class="card"><h2>Top 觸發規則</h2><canvas id="c-rules"></canvas></div>
+      <div class="card"><h2>Top 目標端點</h2><canvas id="c-ep"></canvas></div>
+      <div class="card"><h2>Anomaly Score 分布</h2><canvas id="c-score"></canvas></div>
+      <div class="card"><h2>事件時間線（每分鐘）</h2><canvas id="c-time"></canvas></div>
+      <div class="card full"><h2>模式比較：Detection vs Blocking</h2>
+        <table id="t-modes"><thead><tr><th>模式</th><th>requests</th><th>實際擋</th><th>本來會擋</th><th>平均分數</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
